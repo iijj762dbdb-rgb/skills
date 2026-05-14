@@ -339,6 +339,33 @@ python tools/markdown-query/benchmark.py \
   --queries-json my-queries.json --repeat 3
 ```
 
+### 実行例: `sample/` フォルダーに対するベンチマーク結果
+
+本リポジトリ同梱の [`sample/`](sample/) 配下（業務要件・ユースケース・サービス記述書の Markdown 4 ファイル）に対し、[`tools/markdown-query/queries.sample.txt`](tools/markdown-query/queries.sample.txt) の 5 クエリで実行した **参考値** です。生のレポートは [`tools/markdown-query/results/bench-20260514T012257Z.md`](tools/markdown-query/results/bench-20260514T012257Z.md) を参照してください。
+
+> **重要 — あくまで「例」です**: 以下の数値は **特定の環境・特定のリポジトリ・特定のクエリ集合** で測定したものであり、**ユーザーの環境で同じ結果や精度を保証するものではありません**。Markdown の量・章構造・クエリの語彙・トークナイザ・マシン性能などにより結果は大きく変動します。必ず自分のリポジトリで `benchmark.py` を実行して判断してください。
+
+**測定環境（例）**: `tiktoken/cl100k_base` / Python 3.12.10 / Windows 11 / `top_k=5`, `max_tokens=800`, `repeat=3`
+
+**baseline_full**: 4 files / 83,230 chars / **68,440 tokens**
+
+| シナリオ | avg tokens (with skill) | avg savings vs baseline | latency mean / p50 / p95 (ms) |
+| --- | ---: | ---: | --- |
+| `mdq_bm25` | 1,794.6 | **97.38%** | 13.35 / 13.65 / 14.20 |
+| `mdq_grep` | 700.6 | **98.98%** | 1.45 / 0.47 / 3.33 |
+
+クエリ別（`mdq_bm25`、抜粋）:
+
+| query | hits | tokens | savings % |
+| --- | ---: | ---: | ---: |
+| ロイヤルティプログラム | 5 | 2,484 | 96.37 |
+| 生成AI パーソナライズ | 5 | 1,816 | 97.35 |
+| ポイント付与 失効 | 5 | 1,250 | 98.17 |
+| 会員 同意管理 | 5 | 1,402 | 97.95 |
+| ユースケース | 5 | 2,021 | 97.05 |
+
+> この例では全文投入の **約 1〜3%** までプロンプトトークンが圧縮されています。一方で `mdq_grep` は語の表記揺れに弱く、`生成AI パーソナライズ` など 0 hit になるクエリもあります（`savings % = 100` は「ヒットなし」を意味するため、別途 `coverage_proxy` での確認が必要です）。**削減率だけで判断せず、必ず期待パス付き JSON で coverage も併せて評価してください**。
+
 ## リポジトリ構成
 
 ```
