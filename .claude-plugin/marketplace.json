@@ -1,0 +1,28 @@
+{
+  "name": "dahatake-skills",
+  "owner": {
+    "name": "dahatake",
+    "url": "https://github.com/dahatake"
+  },
+  "metadata": {
+    "description": "dahatake のエージェントスキル集マーケットプレイス。",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "dahatake-skills",
+      "description": "ローカル Markdown 横断クエリなど、コーディングエージェント向けのスキルを提供します。",
+      "version": "0.1.0",
+      "source": ".",
+      "homepage": "https://github.com/dahatake/skills",
+      "repository": "https://github.com/dahatake/skills",
+      "license": "MIT",
+      "author": {
+        "name": "dahatake",
+        "url": "https://github.com/dahatake"
+      },
+      "keywords": ["skills", "agent", "copilot", "markdown", "search"],
+      "skills": "./skills/"
+    }
+  ]
+}

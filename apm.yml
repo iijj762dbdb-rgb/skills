@@ -1,0 +1,17 @@
+name: dahatake-skills
+version: 0.1.0
+description: dahatake のエージェントスキル集。ローカル Markdown 横断クエリなど、コーディングエージェント向けのスキルを提供します。
+
+# Marketplace authoring.
+# NOTE: .claude-plugin/marketplace.json は現在手動でメンテナンスしています。
+# 将来 `apm pack` (https://github.com/microsoft/apm) を使う場合は、生成結果と
+# 手動編集分の差分を必ず確認してください。
+marketplace:
+  owner:
+    name: dahatake
+    url: https://github.com/dahatake
+  packages:
+    - name: dahatake-skills
+      description: dahatake のエージェントスキル集。Markdown 横断検索などのスキルを各種コーディングエージェントから利用できます。
+      source: .
+      homepage: https://github.com/dahatake/skills

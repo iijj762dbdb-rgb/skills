@@ -1,0 +1,8 @@
+# Python virtual environments
+.venv/
+__pycache__/
+*.pyc
+
+# markdown-query index & benchmark artifacts
+.mdq/
+tools/markdown-query/results/
