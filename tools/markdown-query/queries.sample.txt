@@ -1,11 +1,8 @@
 # Sample queries for `markdown-query` benchmark.
 # One query per line. Lines starting with `#` are ignored.
-#
-# 既定の `sample/` 配下（日本語ドキュメント）で実ヒットが出ることを確認済みの
-# 用語で構成しています。別リポジトリで使う場合は、対象ドキュメントの語彙に
-# 合わせて差し替えてください。
-ロイヤルティプログラム
-生成AI パーソナライズ
-ポイント付与 失効
-会員 同意管理
+# These five queries are taken from the SKILL.md examples.
+業務要件 概要
+ARD
+知識ベース
 ユースケース
+アーキテクチャ

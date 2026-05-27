@@ -48,6 +48,38 @@ LLM ベースのコーディングエージェントでは、関連 Markdown を
 - クラウド埋め込み / リモートベクトル検索を使いたい（本スキルは外部 API を呼びません）。
 - 単一の小さな README を眺めたいだけ（普通に開いた方が速い）。
 
+### アーキテクチャ概要
+
+`markdown-query` の実体は本リポジトリ同梱の `mdq/` Python パッケージです。**ローカル完結**（外部 API を呼び出さず、`.mdq/` 配下に SQLite で永続化）であり、CLI・エージェント (Copilot / Claude / Gemini) のいずれからも `python -m mdq` サブプロセスとして起動されます。
+
+```mermaid
+flowchart LR
+  A["エージェント / ユーザー CLI"] -->|"python -m mdq ..."| B["mdq/cli.py (サブコマンド振り分け)"]
+  B --> C["indexer.py + strategies*.py<br/>(Chunking)"]
+  B --> D["query_router.py + search.py<br/>(BM25 検索 + snippet 生成)"]
+  B --> E["watcher.py (任意, 増分監視)"]
+  C --> F[(".mdq/index-&lt;lang&gt;-&lt;strategy&gt;.sqlite")]
+  D --> F
+  E --> C
+  B -. "append" .-> G[(".mdq/usage.jsonl")]
+```
+
+主な構成要素:
+
+| 層 | モジュール | 役割 |
+|---|---|---|
+| CLI | `mdq/__main__.py`, `mdq/cli.py` | argparse でサブコマンド (`index` / `search` / `get` / `list` / `stats` / `watch`) を振り分け、利用ログを記録 |
+| Indexing | `indexer.py`, `strategies.py`, `strategies_semantic.py`, `strategies_pageindex.py` | Markdown を Chunking Strategy ごとに分割し、SQLite に upsert |
+| Search | `query_router.py`, `search.py` | クエリを 7 ルールで分類して strategy 選定 → BM25 検索 → snippet 生成 |
+| Watcher | `watcher.py`（任意、`watchdog` が必要） | ファイル変更を daemon thread で監視し増分索引 |
+| Storage | `store.py` + `.mdq/index-<lang>-<strategy>.sqlite` | SCHEMA v6。`(lang, strategy)` の組み合わせごとに独立した DB ファイル |
+| Logging | `usage_log.py` + `.mdq/usage.jsonl` | 全 CLI 呼び出しを append-only JSONL に記録（任意の統計レポート生成に使用） |
+
+設計上の前提:
+
+- **物理ファイル分離**: 索引 DB は `(lang, strategy)` の組み合わせごとに別ファイル。検索時に Strategy だけを切り替えれば適切な DB が選択されます。
+- **任意拡張**: `watchdog`（Watcher）、`rank_bm25`（高速 BM25）、`fastembed + nltk + numpy`（`semantic_paragraph` 戦略）はいずれも任意依存。未導入時はフォールバック動作します。
+
 ### スキルパッケージに含まれるもの
 
 | パス | 内容 |
@@ -258,13 +290,102 @@ mdq get --chunk-id <ID>
 
 > `mdq` の代わりに `python -m mdq` でも同じサブコマンドを実行できます。詳細なオプションは [`skills/markdown-query/references/cli-reference.md`](skills/markdown-query/references/cli-reference.md) を参照してください。
 
-## 動作確認
+## Chunking Strategy と言語選択
 
-インストール後、エージェントに次のように尋ねてみてください。
+`mdq index` / `mdq search` には **言語** (`--lang`) と **Chunking Strategy** (`--strategy`) を指定できます。索引 DB は組み合わせごとに別ファイル (`.mdq/index-<lang>-<strategy>.sqlite`) として作成されるため、複数 Strategy を並行運用できます。
 
-> このリポジトリ配下の Markdown から "context window" を含む見出しを探して。
+### 言語 (`--lang`)
 
-`markdown-query` スキルが起動し、ヒットしたチャンクのみが返ってくれば成功です。
+| 値 | FTS5 tokenizer | 用途 |
+|---|---|---|
+| `ja-jp`（既定） | `trigram`（SQLite 3.34+。未対応環境では `unicode61` にフォールバック） | 日本語 |
+| `en-us` | `unicode61` | 英語 |
+
+### Chunking Strategy (`--strategy`)
+
+| 戦略 | 境界 | 既定パラメータ | overlap | 任意依存 |
+|---|---|---|---|---|
+| `heading`（既定 / legacy） | Markdown 見出しごとに 1 chunk | `--max-chunk-chars`（既定 0 = 無制限） | なし | なし |
+| `heading_recursive` | 見出し chunk が大きい場合に段落／行で再分割 | 2,000 字超で再分割 | 段落単位（既定 1 段落、`--overlap-paragraphs` で 0〜5） | なし |
+| `fixed_window` | 見出し構造を無視し、固定窓スライド | 1,000 字 / overlap 200 字 | 200 字 | なし |
+| `semantic_paragraph` | 見出しを hard boundary とし、文 embedding 類似度（Kamradt 二分探索）で意味境界決定 | min 200 / max 1,000 字、percentile 50〜99 | なし（意味境界自動） | `pip install -e .[semantic]`（fastembed + nltk + numpy）。既定モデル `intfloat/multilingual-e5-large`（初回 ~2GB DL） |
+| `pageindex` | 見出しベースのツリー索引。各ノードに `chunks.summary`（先頭抽出）を保存 | サマリ 200 字 / モード `head` | なし | なし（LLM 不要） |
+| `auto`（`search` 既定） | クエリ内容から自動選択（次節「クエリルーティング」参照） | — | — | — |
+
+主要オプション（`mdq index` / `mdq search` 共通）:
+
+| オプション | 説明 |
+|---|---|
+| `--lang ja-jp|en-us` | 言語選択 |
+| `--strategy <name>` | Chunking Strategy（`search` では `auto` 既定） |
+| `--max-chunk-chars N` | `heading` / `semantic_paragraph` のチャンク最大文字数 |
+| `--overlap-paragraphs N` | `heading_recursive` の段落単位 overlap |
+| `--late-chunking` | `semantic_paragraph` 索引時に `chunk_embedding` (float32 BLOB) を保存 |
+| `--fusion-alpha α` | `search` で BM25 + embedding 類似度を線形加重統合（`--late-chunking` 索引が前提） |
+| `--include-parent` / `--with-parent-depth N` | ヒットチャンクの直近上位見出しチェーンを `expansion.parent` に含める |
+| `--pageindex-tree-depth N` | `pageindex` で `search` 時にルート→ヒットの summary 連鎖を `expansion.tree_path` に返す |
+| `--db <PATH>` | `--lang/--strategy` から導出される DB パスを明示上書き |
+
+CLI 例:
+
+```sh
+# 日本語・heading_recursive で索引（段落 overlap=2）
+python -m mdq index --lang ja-jp --strategy heading_recursive --overlap-paragraphs 2
+
+# semantic_paragraph で索引（late-chunking 有効化）
+pip install -e .[semantic]
+python -m mdq index --strategy semantic_paragraph --max-chunk-chars 1000 --late-chunking
+
+# 英語・auto 選択で検索
+python -m mdq search --lang en-us --q "design pattern overview" --with-parent-depth 2
+```
+
+## クエリルーティング（`--strategy auto`）
+
+`mdq search --strategy auto`（既定）は、`mdq/query_router.py` がクエリを以下 7 ルールで分類し、選定 Strategy の DB が存在しない場合は fallback chain に従って切り替えます。
+
+### ルール（上から評価、最初に該当したもの採用）
+
+| Rule | 条件 | 選択 Strategy | reason ID |
+|---|---|---|---|
+| R2′ | `--mode grep` | `heading` | `exact_match` |
+| R1 | ID 風（英数+ハイフンの単語） | `heading` | `id_lookup` |
+| R2 | 引用符付き完全一致 | `heading` | `exact_match` |
+| R6 | コード片（バッククォート / 記号密） | `fixed_window` | `code_fragment` |
+| R3 | 短い固有名詞（≤ 2 トークン） | `heading` | `short_proper_noun` |
+| R4 | 概念語（`概要` / `とは` / `what` 等） | `pageindex`（不在時はフォールバック） | `concept_overview` |
+| R5 | 物語的質問（`なぜ` / `どのように` / `?`） | `semantic_paragraph`（不在時 `heading_recursive`） | `narrative_query` |
+| R7 | 既定 | `heading_recursive` | `default` |
+
+### Fallback chain
+
+選定 Strategy の DB が `.mdq/index-*-*.sqlite` に存在しなければ、以下の順で利用可能な最初のものへ切り替わります（`fallback_used=True` が usage_log に記録されます）。
+
+`pageindex → semantic_paragraph → heading_recursive → heading → fixed_window`
+
+複数 Strategy を並行運用したい場合は、用途に応じた組み合わせで先に索引を作成しておくことを推奨します。
+
+## 索引データファイルと更新
+
+`.mdq/` 配下に永続化される主要ファイルと更新トリガは以下のとおりです。`.mdq/` は `.gitignore` 推奨です。
+
+| ファイル / テーブル | 役割 | 更新契機 | サイズ目安 |
+|---|---|---|---|
+| `.mdq/index-<lang>-<strategy>.sqlite` の `files` テーブル | ファイル単位の SHA-1 / mtime / size / frontmatter | `mdq index` / Watcher | 〜数 MB |
+| 同 `chunks` テーブル | 分割後のチャンク本文 + heading_path + part_index + parent_chunk_id (v4) | 同上 | 数十〜数百 MB |
+| 同 `chunks_fts`（FTS5 mirror） | 全文検索用トークン索引（v3 以降） | `chunks` への INSERT/DELETE と同一トランザクション | `chunks` の 0.5〜1.5 倍 |
+| 同 `chunks.text_raw` 列 (v5) | `semantic_paragraph` の contextualize ON 時に原文を保存 | `semantic_paragraph` 索引時のみ | `chunks.body` の 0.7 倍程度 |
+| 同 `chunks.chunk_embedding` 列 (v5) | float32 埋め込みベクトル | `semantic_paragraph` + `--late-chunking` 索引時のみ | チャンク数 × 4 KB |
+| 同 `chunks.summary` 列 (v6) | `pageindex` のノードサマリ | `pageindex` 索引時のみ | チャンク数 × 最大 2 KB |
+| `.mdq/usage.jsonl` | 全 mdq CLI 呼び出しの append-only ログ | 全サブコマンド完了時 | 1 行 ~500 B |
+
+運用 Tips:
+
+- **増分判定**: `mdq index` は `(stored_sha1 == current_sha1)` で skip するため、`git checkout` のように内容が同じで mtime だけ変わるケースでも余計な再索引は走りません。完全性が要件なら `--rebuild` を使用してください。
+- **Strategy 切り替え時**: 新 Strategy の索引は別 DB ファイルに生成されるため、既存 DB は触らず並行運用できます。
+- **DB 破損時**: `.mdq/index-<lang>-<strategy>.sqlite` を削除して `mdq index --strategy <name>` で再生成すれば復旧します。`.mdq/usage.jsonl` は索引と独立なので削除不要です。
+- **同一 (lang, strategy) の並行書き込み禁止**: SQLite ファイルロック (Windows) で失敗します。Watcher 実行中に手動 `mdq index` を流す場合は Watcher を停止してください。
+- **機微情報注意**: `.mdq/usage.jsonl` には検索クエリ `args.q` がそのまま記録されます。機密語句で検索した場合は内容を確認の上でリポジトリ外に出してください。
 
 ## 評価方法（ベンチマーク）
 
@@ -365,6 +486,90 @@ python tools/markdown-query/benchmark.py \
 | ユースケース | 5 | 2,021 | 97.05 |
 
 > この例では全文投入の **約 1〜3%** までプロンプトトークンが圧縮されています。一方で `mdq_grep` は語の表記揺れに弱く、`生成AI パーソナライズ` など 0 hit になるクエリもあります（`savings % = 100` は「ヒットなし」を意味するため、別途 `coverage_proxy` での確認が必要です）。**削減率だけで判断せず、必ず期待パス付き JSON で coverage も併せて評価してください**。
+
+## 利用統計レポート（任意）
+
+`mdq` の全 CLI 呼び出しは `.mdq/usage.jsonl` に append-only で記録されます。これを集計して、Skill が実際に呼ばれているか・Context 削減が効いているかを定量化できます。
+
+- 集計モジュール: [`mdq/usage_stats.py`](mdq/usage_stats.py)
+- レポート生成スクリプト: [`tools/markdown-query/generate_usage_report.py`](tools/markdown-query/generate_usage_report.py)
+- 出力先: `tools/markdown-query/usage-report/YYYY-MM-DD.{json,md}` および `latest.{json,md}`
+- 保持期間: 既定 90 日（`--retention-days N` で変更、`0` で無効化）。`latest.*` は常に保持されます。
+
+`usage.jsonl` の各行は次のスキーマで、検索ごとに 1 行ずつ追記されます:
+
+```json
+{
+  "ts": "2026-05-21T12:34:56.789Z",
+  "command": "search",
+  "args": {"q": "…", "mode": "bm25", "strategy": "auto",
+            "effective_strategy": "heading_recursive",
+            "router_reason": "default", "router_rule_id": 7,
+            "router_fallback_used": false},
+  "elapsed_ms": 42,
+  "result": {"hit_count": 8, "snippet_chars": 1234, "source_file_chars": 56789,
+              "score_top": 12.3, "score_2nd": 9.8, "parent_expanded": 2},
+  "exit_code": 0,
+  "context": {"repo_root": "/abs/path"}
+}
+```
+
+### 主要指標（抜粋）
+
+レポートは「インデックスの統計情報」と「Skill 利用統計情報」の 2 セクションで構成され、後者は直近 7 日間を既定ウィンドウとして以下のような指標を算出します。
+
+| グループ | 指標 | 何を見るか |
+|---|---|---|
+| 基盤・索引 | E1 索引サイズ / E2 索引鮮度 / E5 孤児チャンク削除累計 / F2 索引差分更新比率 | 索引が新しいか、増分更新が効いているか |
+| 呼び出し量 | A1 サブコマンド別呼び出し回数 / A4 Skill ルーティング記載有無 / D1 DO NOT USE FOR 違反 | Skill が実際に呼ばれているか、棲み分けが守られているか |
+| Context 削減 | B1 Context 削減率 / B2 引数平均（top_k / max_tokens / snippet_radius） / B3 get/search 比率 | Skill の中核目的（Context 節約）が効いているか |
+| 結果品質 | C1 ヒット 0 件率 / C2 上位 2 件 score 差 / C3 expansion フラグ使用率 | 検索がクエリに合っているか、チャンク粒度が適切か |
+| パフォーマンス | F1 search 実行時間 p50/p95 | Skill の応答性能 |
+| ルーティング (v2.0) | H1 auto_strategy 分布 / H2 parent 展開率 | `--strategy auto` で何が選ばれているか、parent 展開が効いているか |
+
+> 注: 一部の指標（例: `A2 Step あたり呼び出し回数`、`G1 mdq 利用 Step 完了率差`、`G4 Step 再実行回数差`、`D3 典型クエリ出現率`）は上位オーケストレーター（HVE 等）が `HVE_STEP_ID` / `context.run_id` などを usage_log に注入する前提で動作するため、本プラグイン単体では未利用となります。詳細は [`mdq/usage_stats.py`](mdq/usage_stats.py) のドキュメンテーション参照。
+
+## 他リポジトリへの移植チェックリスト
+
+`markdown-query` Skill を別リポジトリへ持ち込む際に **「エージェントが実際に呼んでくれる状態」** へ仕上げるための導入チェックリストです。配置だけでは採用率が伸びないことが多く、以下 5 項目を併せて整備することを推奨します。
+
+### 1. Windows 文字コード起因の exit 1 を解消する
+
+[`mdq/cli.py`](mdq/cli.py) の `main()` は標準出力を再構成しないため、Windows の cp932 ロケールでヒットに絵文字が含まれると `UnicodeEncodeError` で **exit code 1** を返すことがあります。エージェントは「壊れている」と判断してツールを回避するため、最初に解消してください。
+
+- 恒久対策: `main()` の冒頭で `sys.stdout.reconfigure(encoding='utf-8', errors='replace')` を呼ぶ。
+- 暫定回避: 環境変数 `PYTHONIOENCODING=utf-8` を設定する。
+
+### 2. 最上位ルールに Markdown 検索の優先順位を明記する
+
+リポジトリ最上位のエージェント共通ルール文書（`.github/copilot-instructions.md` / `CLAUDE.md` / `AGENTS.md` 等）に、優先順位を明記してください。
+
+```markdown
+- Markdown ファイル群を対象とした検索・横断クエリは、まず `markdown-query` Skill
+  （`python -m mdq search ...`）を試す。0 ヒットまたは目的が一致しない場合に限り
+  `grep_search` / `read_file` へフォールバックする。
+- ソースコード（`.py`, `.ts` 等）の検索や、Markdown 編集／生成は本 Skill の対象外。
+```
+
+### 3. SKILL.md `description` に `grep_search` も `PREFER OVER` に含める
+
+[`skills/markdown-query/SKILL.md`](skills/markdown-query/SKILL.md) の frontmatter で `read_file` / `cat` だけでなく `grep_search` も明示すると、上位指示で `grep_search` を「標準」とするエージェントホストでも選ばれやすくなります。
+
+### 4. Skill ルーティング表で `.md` 限定優先を明示する
+
+ルーティング相当文書がある場合は `grep_search` 行から `markdown-query` への誘導文言を追加してください。
+
+### 5. 初回索引の自動化（採用障壁の除去）
+
+索引が無い状態で `mdq search` を呼ぶと 0 件返却となり、エージェントが諦める誘因になります。以下のいずれかで初回索引を自動化してください。
+
+- CI / pre-commit / devcontainer 起動スクリプトに `python -m mdq index` を組み込む
+- エージェント onboarding ステップで `mdq stats` → 0 件なら自動 `index` を実行（[`skills/markdown-query/SKILL.md`](skills/markdown-query/SKILL.md) §手順サマリに該当記載あり）
+- リポジトリルートに `mdq.toml` を作成し `[index].roots` にドキュメントディレクトリを列挙（推奨）。[`mdq/cli.py`](mdq/cli.py) の `DEFAULT_ROOTS` は設定ファイル不在時の最小フォールバックです
+
+### 採用率の検証
+
+導入後 1〜2 週間運用してから [`tools/markdown-query/generate_usage_report.py`](tools/markdown-query/generate_usage_report.py) を実行し、**A1 `search` 件数** がタスク数に対して妥当か確認してください。極端に少ない場合は上記 1〜5 の未実施項目を再点検します。自リポジトリでの実測トークン削減率は `python tools/markdown-query/benchmark.py` で取得し、**Skill 改善前後の 2 回比較で相対変化を見る** ことを推奨します。
 
 ## リポジトリ構成
 

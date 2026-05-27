@@ -1,4 +1,4 @@
-"""Benchmark `markdown-query` Skill against naive full-context baselines.
+﻿"""Benchmark `markdown-query` Skill against naive full-context baselines.
 
 Goal
 ----
@@ -24,12 +24,12 @@ Tokenizer
 
 Usage
 -----
-    python tools/markdown-query/benchmark.py \
-        --queries-file tools/markdown-query/queries.sample.txt \
+    python tools/skills/markdown_query/benchmark.py \
+        --queries-file tools/skills/markdown_query/queries.sample.txt \
         --top-k 5 --max-tokens 800 --repeat 3
 
-    python tools/markdown-query/benchmark.py \
-        --queries-json tools/markdown-query/queries.json \
+    python tools/skills/markdown_query/benchmark.py \
+        --queries-json tools/skills/markdown_query/queries.json \
         --scenarios mdq_bm25,mdq_grep \
         --ensure-index
 
@@ -57,8 +57,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# benchmark.py lives at <repo>/tools/markdown-query/benchmark.py
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# benchmark.py lives at <repo>/tools/skills/markdown_query/benchmark.py
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -99,64 +99,6 @@ _DEFAULT_EXCLUDED_PARTS = frozenset({
     ".git", "node_modules", ".venv", "venv", "__pycache__",
     ".mdq", "dist", "build", ".next", ".cache", "results",
 })
-
-# Fixed prompt template used for the "without skill vs with skill" comparison.
-# Both scenarios use the EXACT same template so the only variable is `{context}`
-# (full corpus vs mdq hits).
-PROMPT_TEMPLATE = """あなたは技術文書を読み解くアシスタントです。
-以下の <資料> を参考に <質問> に答えてください。
-
-<資料>
-{context}
-</資料>
-
-<質問>
-{query}
-</質問>
-"""
-
-
-def collect_baseline_text(repo_root: Path, roots: list[str],
-                          path_globs: list[str] | None) -> tuple[str, dict[str, Any]]:
-    """Read every .md under roots (filtered like baseline_full) and return
-    (concatenated_text, stats_dict).
-
-    The concatenated text is used as the `{context}` for the "without skill"
-    prompt. Same exclusion rules as :func:`baseline_full`.
-    """
-    files = 0
-    chars = 0
-    file_list: list[str] = []
-    parts: list[str] = []
-    for r in roots:
-        base = (repo_root / r).resolve()
-        if not base.exists():
-            continue
-        for p in sorted(base.rglob("*.md")):
-            rel_parts = p.relative_to(repo_root).parts
-            if any(part in _DEFAULT_EXCLUDED_PARTS for part in rel_parts):
-                continue
-            rel = p.relative_to(repo_root).as_posix()
-            if path_globs and not any(fnmatch.fnmatch(rel, g) for g in path_globs):
-                continue
-            try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            files += 1
-            chars += len(text)
-            file_list.append(rel)
-            parts.append(f"# FILE: {rel}\n{text}")
-    concatenated = "\n\n".join(parts)
-    stats = {
-        "files": files,
-        "chars": chars,
-        "tokens": count_tokens(concatenated) if concatenated else 0,
-        "roots": roots,
-        "path_globs": path_globs,
-        "file_list_sample": file_list[:5],
-    }
-    return concatenated, stats
 
 
 def baseline_full(repo_root: Path, roots: list[str],
@@ -263,22 +205,12 @@ def _stats_ms(samples: list[float]) -> dict[str, Any]:
 def run_search_scenario(conn, mode: str, queries: list[dict[str, Any]], *,
                         top_k: int, max_tokens: int, repeat: int,
                         path_globs: list[str] | None,
-                        baseline_tokens_total: int,
-                        baseline_context_text: str | None = None) -> dict[str, Any]:
-    """Run one search scenario (bm25 or grep) for all queries.
-
-    When ``baseline_context_text`` is provided, per-query without/with-skill
-    prompt token counts are also computed using :data:`PROMPT_TEMPLATE`:
-      - without_skill_prompt_tokens = tokens(template.format(context=<full corpus>, query=q))
-      - with_skill_prompt_tokens    = tokens(template.format(context=<hits payload>, query=q))
-    """
+                        baseline_tokens_total: int) -> dict[str, Any]:
+    """Run one search scenario (bm25 or grep) for all queries."""
     per_query: list[dict[str, Any]] = []
     all_latencies_ms: list[float] = []
     total_response_tokens = 0
     total_hits = 0
-    total_without_tokens = 0
-    total_with_tokens = 0
-    with_prompt_enabled = baseline_context_text is not None
 
     for entry in queries:
         q = entry["q"]
@@ -319,28 +251,6 @@ def run_search_scenario(conn, mode: str, queries: list[dict[str, Any]], *,
                 (1 - resp_tokens / baseline_tokens_total) * 100, 4
             )
 
-        # Without-skill vs With-skill prompt token comparison (uses fixed template).
-        without_prompt_tokens: int | None = None
-        with_prompt_tokens: int | None = None
-        reduction_tokens: int | None = None
-        reduction_pct: float | None = None
-        if with_prompt_enabled:
-            without_prompt = PROMPT_TEMPLATE.format(
-                context=baseline_context_text, query=q,
-            )
-            with_prompt = PROMPT_TEMPLATE.format(
-                context=payload, query=q,
-            )
-            without_prompt_tokens = count_tokens(without_prompt)
-            with_prompt_tokens = count_tokens(with_prompt)
-            reduction_tokens = without_prompt_tokens - with_prompt_tokens
-            if without_prompt_tokens > 0:
-                reduction_pct = round(
-                    (reduction_tokens / without_prompt_tokens) * 100, 4
-                )
-            total_without_tokens += without_prompt_tokens
-            total_with_tokens += with_prompt_tokens
-
         per_query.append({
             "query": q,
             "hits": len(last_hits),
@@ -348,10 +258,6 @@ def run_search_scenario(conn, mode: str, queries: list[dict[str, Any]], *,
             "response_chars": len(payload),
             "response_tokens": resp_tokens,
             "vs_baseline_savings_pct": savings_pct,
-            "without_skill_prompt_tokens": without_prompt_tokens,
-            "with_skill_prompt_tokens": with_prompt_tokens,
-            "reduction_tokens": reduction_tokens,
-            "reduction_pct": reduction_pct,
             "latency_ms": _stats_ms(latencies),
             "coverage_proxy": coverage,
             "expected_paths": expected or None,
@@ -359,22 +265,12 @@ def run_search_scenario(conn, mode: str, queries: list[dict[str, Any]], *,
 
     avg_tokens: float | None = None
     avg_savings: float | None = None
-    avg_without: float | None = None
-    avg_with: float | None = None
-    avg_reduction_pct: float | None = None
     if queries:
         avg_tokens = round(total_response_tokens / len(queries), 2)
         if baseline_tokens_total > 0:
             avg_savings = round(
                 (1 - avg_tokens / baseline_tokens_total) * 100, 4
             )
-        if with_prompt_enabled:
-            avg_without = round(total_without_tokens / len(queries), 2)
-            avg_with = round(total_with_tokens / len(queries), 2)
-            if avg_without > 0:
-                avg_reduction_pct = round(
-                    (1 - avg_with / avg_without) * 100, 4
-                )
 
     return {
         "mode": mode,
@@ -382,9 +278,6 @@ def run_search_scenario(conn, mode: str, queries: list[dict[str, Any]], *,
         "total_hits": total_hits,
         "avg_response_tokens": avg_tokens,
         "avg_vs_baseline_savings_pct": avg_savings,
-        "avg_without_skill_prompt_tokens": avg_without,
-        "avg_with_skill_prompt_tokens": avg_with,
-        "avg_reduction_pct": avg_reduction_pct,
         "latency_ms_all": _stats_ms(all_latencies_ms),
         "per_query": per_query,
     }
@@ -434,7 +327,6 @@ def build_report(args: argparse.Namespace, queries: list[dict[str, Any]],
         },
         "index": index_summary,
         "baseline_full": baseline,
-        "prompt_template": PROMPT_TEMPLATE,
         "scenarios": scenario_results,
     }
 
@@ -443,85 +335,119 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
     lines: list[str] = []
     lines.append(f"# mdq benchmark — {report['started_at']}")
     lines.append("")
-    lines.append("## Environment")
+    lines.append("> **このレポートで測っていること**")
+    lines.append(">")
+    lines.append("> `markdown-query` (mdq) Skill を使うことで、"
+                 "**LLM に渡すコンテキスト（= 消費トークン）が、Skillなしで全 Markdown を直接渡す場合と比べてどれだけ減るか**、"
+                 "そして **検索レスポンスがどれだけ速いか** を、"
+                 "OpenAI 系モデルで使われる `tiktoken` の `cl100k_base` トークナイザで実測したものです。")
+    lines.append("")
+    lines.append("- **Skillなし（baseline_full）**: 該当ディレクトリ配下の `.md` をすべて連結して LLM に渡したときのトークン数")
+    lines.append("- **Skillあり（mdq_bm25 / mdq_grep）**: 同じ質問を mdq の検索（BM25 / grep）で投げ、ヒットした該当チャンクだけを LLM に渡したときのトークン数")
+    lines.append("")
+    lines.append("## Environment（実行環境）")
+    lines.append("")
+    lines.append("計測に使ったトークナイザ・実行マシン・Git commit。`tokenizer` が `fallback(chars/4)` の場合は tiktoken 未導入のため文字数÷4 で近似していることを意味します。")
+    lines.append("")
     env = report["env"]
     lines.append(f"- tokenizer: `{env['tokenizer']}`")
     lines.append(f"- python: `{env['python']}`")
     lines.append(f"- platform: `{env['platform']}`")
     lines.append(f"- commit: `{env['commit']}`")
     lines.append("")
-    lines.append("## Parameters")
+    lines.append("## Parameters（実行パラメータ）")
+    lines.append("")
+    lines.append("ベンチマーク呼び出し時の引数。`roots` 配下の `.md` がベースライン対象、`queries_count` 件の質問を `repeat` 回ずつ計測しています。")
+    lines.append("")
     for k, v in report["params"].items():
         lines.append(f"- {k}: `{v}`")
     lines.append("")
+
+    # Prompts used (queries themselves are the prompts sent to mdq).
+    queries_params = report["params"].get("queries_count", 0)
+    if queries_params:
+        lines.append("## 比較に使った Prompt（検索クエリ）")
+        lines.append("")
+        lines.append("mdq に投げた検索文字列の一覧です。Skillなし側ではこれらの質問に答えるために "
+                     "全 Markdown を LLM に渡す前提でトークン数を算出しています。")
+        lines.append("")
+        # Pull prompts from the first scenario's per_query (all scenarios share them).
+        prompts_listed: list[str] = []
+        for _name, s in report["scenarios"].items():
+            for q in s["per_query"]:
+                if q["query"] not in prompts_listed:
+                    prompts_listed.append(q["query"])
+            break
+        for i, p in enumerate(prompts_listed, 1):
+            lines.append(f"{i}. `{p}`")
+        lines.append("")
+
     if report.get("index"):
-        lines.append("## Index summary")
+        lines.append("## Index summary（mdq インデックス構築結果）")
+        lines.append("")
+        lines.append("mdq が SQLite に格納したファイル/チャンク数と所要時間。"
+                     "`files_indexed` がベースラインのファイル数とほぼ一致していれば対象を正しく拾えています。")
+        lines.append("")
         lines.append("```json")
         lines.append(json.dumps(report["index"], ensure_ascii=False, indent=2))
         lines.append("```")
         lines.append("")
     base = report.get("baseline_full")
     if base:
-        lines.append("## baseline_full")
-        lines.append(f"- files: **{base['files']}**")
-        lines.append(f"- chars: **{base['chars']:,}**")
-        lines.append(f"- tokens: **{base['tokens']:,}**")
+        lines.append("## Skillなしの場合のトークン消費（baseline_full）")
         lines.append("")
-    if report.get("prompt_template"):
-        lines.append("## Prompt template")
+        lines.append("`roots` 配下の全 `.md` を **1リクエストにそのまま貼り付けて LLM に渡した場合** の合計トークン数。"
+                     "この値が比較の分母（= Skillなしのコスト）になります。")
         lines.append("")
-        lines.append("両シナリオで同一のテンプレートを使用し、`{context}` の中身だけを")
-        lines.append("「全 `.md` 連結」にした場合（Skill なし）と「mdq のヒット」にした場合「")
-        lines.append("（Skill あり）でトークン数を比較します。")
+        lines.append(f"- 対象ファイル数: **{base['files']}**")
+        lines.append(f"- 合計文字数: **{base['chars']:,}**")
+        lines.append(f"- **合計トークン数（= Skillなしのコスト）: {base['tokens']:,} tokens**")
         lines.append("")
-        lines.append("```text")
-        lines.append(report["prompt_template"].rstrip("\n"))
-        lines.append("```")
-        lines.append("")
-    if report["scenarios"]:
-        # Direct comparison: Without-skill vs With-skill (per query).
-        any_with_prompt = any(
-            s.get("avg_without_skill_prompt_tokens") is not None
-            for s in report["scenarios"].values()
-        )
-        if any_with_prompt:
-            lines.append("## Skill なし vs Skill あり (プロンプトトークン比較)")
-            lines.append("")
-            lines.append("同一のプロンプトテンプレートに対し、`{context}` に全文を詰めた場合と mdq ヒットを詰めた場合の実測トークン数。")
-            lines.append("")
-            for name, s in report["scenarios"].items():
-                if s.get("avg_without_skill_prompt_tokens") is None:
-                    continue
-                lines.append(f"### {name}")
-                lines.append("")
-                lines.append(
-                    f"- avg without skill (full corpus prompt): **{s['avg_without_skill_prompt_tokens']:,} tokens**"
-                )
-                lines.append(
-                    f"- avg with skill (mdq hits prompt):       **{s['avg_with_skill_prompt_tokens']:,} tokens**"
-                )
-                avg_red = s.get("avg_reduction_pct")
-                if avg_red is not None:
-                    lines.append(f"- avg reduction: **{avg_red:.4f}%**")
-                lines.append("")
-                lines.append("| query | without skill (tokens) | with skill (tokens) | reduction (tokens) | reduction % | mean ms |")
-                lines.append("|---|---:|---:|---:|---:|---:|")
-                for q in s["per_query"]:
-                    wo = q.get("without_skill_prompt_tokens")
-                    wi = q.get("with_skill_prompt_tokens")
-                    rd = q.get("reduction_tokens")
-                    rp = q.get("reduction_pct")
-                    wo_s = f"{wo:,}" if wo is not None else "n/a"
-                    wi_s = f"{wi:,}" if wi is not None else "n/a"
-                    rd_s = f"{rd:,}" if rd is not None else "n/a"
-                    rp_s = f"{rp:.4f}" if rp is not None else "n/a"
-                    lines.append(
-                        f"| `{q['query']}` | {wo_s} | {wi_s} | {rd_s} | "
-                        f"{rp_s} | {q['latency_ms']['mean']} |"
-                    )
-                lines.append("")
 
-        lines.append("## Scenario summary")
+    base_tokens = base["tokens"] if base else 0
+
+    if report["scenarios"]:
+        lines.append("## Skillなし vs Skillあり 直接比較")
+        lines.append("")
+        lines.append("各 Prompt について、")
+        lines.append("「Skillなし（全 md を貼り付け）= 上の baseline トークン数」と "
+                     "「Skillあり（mdq の検索結果のみ）」を並べて、削減トークン数・削減率を出しています。")
+        lines.append("")
+        for name, s in report["scenarios"].items():
+            mode_label = "BM25 検索（意味的にスコアリング）" if name == "mdq_bm25" else "grep 検索（部分一致）"
+            lines.append(f"### Skill: `{name}` — {mode_label}")
+            lines.append("")
+            lines.append("| # | Prompt | Skillなし tokens | Skillあり tokens | 削減 tokens | 削減率 | レスポンス mean (ms) |")
+            lines.append("|---:|---|---:|---:|---:|---:|---:|")
+            for i, q in enumerate(s["per_query"], 1):
+                skill_tok = q["response_tokens"]
+                reduced = base_tokens - skill_tok if base_tokens else None
+                sv = (f"{q['vs_baseline_savings_pct']:.2f}%"
+                      if q["vs_baseline_savings_pct"] is not None else "n/a")
+                lines.append(
+                    f"| {i} | `{q['query']}` | {base_tokens:,} | {skill_tok:,} | "
+                    f"{reduced:,} | {sv} | {q['latency_ms']['mean']} |"
+                )
+            # Summary row for the scenario.
+            if s["avg_response_tokens"] is not None:
+                avg_tok = s["avg_response_tokens"]
+                avg_reduced = (base_tokens - avg_tok) if base_tokens else None
+                avg_sv = (f"{s['avg_vs_baseline_savings_pct']:.2f}%"
+                          if s["avg_vs_baseline_savings_pct"] is not None else "n/a")
+                lines.append(
+                    f"| — | **平均** | **{base_tokens:,}** | **{avg_tok}** | "
+                    f"**{avg_reduced:,.0f}** | **{avg_sv}** | "
+                    f"**{s['latency_ms_all']['mean']}** |"
+                )
+            lines.append("")
+
+        lines.append("## Scenario summary（シナリオ集計）")
+        lines.append("")
+        lines.append("各シナリオの全クエリ平均をまとめた表。"
+                     "`avg tokens` が小さいほど LLM への入力が軽く、"
+                     "`avg savings vs baseline` が高いほど Skill による削減効果が大きいことを示します。"
+                     "`latency` は `--repeat` 回の各クエリ実行時間 (ms) を全クエリ横断で集計したもので、"
+                     "mean=平均 / p50=中央値 / p95=遅い側 5% を切ったあたり、です。")
         lines.append("")
         lines.append("| scenario | queries | avg tokens | avg savings vs baseline | latency mean / p50 / p95 (ms) |")
         lines.append("|---|---:|---:|---:|---|")
@@ -534,6 +460,16 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
                 f"{savings} | "
                 f"{lat['mean']} / {lat['p50']} / {lat['p95']} |"
             )
+        lines.append("")
+        lines.append("## クエリ別の詳細")
+        lines.append("")
+        lines.append("各列の意味:")
+        lines.append("")
+        lines.append("- **hits**: mdq がヒットとして返したチャンク数（最大 `top_k`）")
+        lines.append("- **tokens**: そのヒット集合を LLM に渡す場合のトークン数（= Skillあり時のコスト）")
+        lines.append("- **savings %**: baseline_full の全文トークン数に対する削減率（= 1 − tokens / baseline_tokens）")
+        lines.append("- **mean ms / p95 ms**: 検索処理だけの所要時間。`--repeat` 回の計測値から算出（p95 は n≥5 のときのみ）")
+        lines.append("- **coverage**: `queries.json` で `expected_paths` を指定したときのみ算出される、期待パスがヒットに含まれた割合")
         lines.append("")
         for name, s in report["scenarios"].items():
             lines.append(f"### {name} — per query")
@@ -557,7 +493,7 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-SCENARIOS_ALL = ("baseline_full", "mdq_bm25", "mdq_grep")
+SCENARIOS_ALL = ("baseline_full", "mdq_bm25", "mdq_grep", "mdq_auto")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -642,25 +578,116 @@ def main(argv: list[str] | None = None) -> int:
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     baseline: dict[str, Any] | None = None
-    baseline_context_text: str | None = None
     if "baseline_full" in requested:
-        baseline_context_text, baseline = collect_baseline_text(
-            REPO_ROOT, roots, args.paths,
-        )
+        baseline = baseline_full(REPO_ROOT, roots, args.paths)
         print(json.dumps({"event": "baseline_full", "data": baseline},
                          ensure_ascii=False))
-    elif any(s.startswith("mdq_") for s in requested):
-        # baseline_full を scenarios から外しても prompt 比較は出したいので
-        # コーパスを読み込んでおく（「baseline_full」セクションは出さない）。
-        baseline_context_text, _ = collect_baseline_text(
-            REPO_ROOT, roots, args.paths,
-        )
 
     baseline_tokens_total = baseline["tokens"] if baseline else 0
 
     scenario_results: dict[str, dict[str, Any]] = {}
+    # Cache per-strategy connections for mdq_auto.
+    _strategy_conns: dict[str, Any] = {}
+
+    def _conn_for_strategy(strategy: str):
+        if strategy in _strategy_conns:
+            return _strategy_conns[strategy]
+        db_p = REPO_ROOT / store.db_path_for(lang="ja-jp", strategy=strategy)
+        if not db_p.exists():
+            return None
+        c = store.open_store(db_p, lang="ja-jp")
+        _strategy_conns[strategy] = c
+        return c
+
     for scenario in requested:
         if scenario == "baseline_full":
+            continue
+        if scenario == "mdq_auto":
+            # Per-query routing: call query_router and dispatch to the
+            # appropriate per-strategy DB. Falls back to the default conn
+            # when no per-strategy DB is present.
+            try:
+                from mdq import query_router as _qr
+            except Exception as exc:
+                print(f"ERROR: mdq.query_router unavailable: {exc}",
+                      file=sys.stderr)
+                continue
+            available = _qr.discover_available_strategies(REPO_ROOT)
+            auto_per_query: list[dict[str, Any]] = []
+            all_lat: list[float] = []
+            total_tokens = 0
+            total_hits_n = 0
+            for entry in queries:
+                q = entry["q"]
+                decision = _qr.classify_query(
+                    q,
+                    available_strategies=available if available else None,
+                    mode="bm25",
+                )
+                c = _conn_for_strategy(decision.strategy) or conn
+                # warmup
+                searcher.search(c, q, mode="bm25", top_k=args.top_k,
+                                max_tokens=args.max_tokens,
+                                path_globs=args.paths)
+                lats: list[float] = []
+                hits = []
+                for _ in range(args.repeat):
+                    t0 = time.perf_counter()
+                    hits = searcher.search(
+                        c, q, mode="bm25", top_k=args.top_k,
+                        max_tokens=args.max_tokens, path_globs=args.paths,
+                    )
+                    t1 = time.perf_counter()
+                    lats.append((t1 - t0) * 1000.0)
+                payload = "\n".join(
+                    json.dumps(h.to_dict(), ensure_ascii=False) for h in hits
+                )
+                resp_tokens = count_tokens(payload)
+                total_tokens += resp_tokens
+                total_hits_n += len(hits)
+                all_lat.extend(lats)
+                auto_per_query.append({
+                    "query": q,
+                    "hits": len(hits),
+                    "response_tokens": resp_tokens,
+                    "router_strategy": decision.strategy,
+                    "router_reason": decision.reason,
+                    "router_fallback_used": decision.fallback_used,
+                    "latency_ms": {
+                        "mean": round(statistics.mean(lats), 3),
+                        "p50": round(statistics.median(lats), 3),
+                        "p95": round(
+                            statistics.quantiles(lats, n=20)[18]
+                            if len(lats) >= 2 else lats[0], 3),
+                    },
+                })
+            avg_tokens = total_tokens / max(1, len(queries))
+            savings_pct = (
+                round((1.0 - avg_tokens / (baseline_tokens_total / max(1, len(queries)))) * 100.0, 2)
+                if baseline_tokens_total else None
+            )
+            r = {
+                "per_query": auto_per_query,
+                "avg_response_tokens": round(avg_tokens, 2),
+                "avg_vs_baseline_savings_pct": savings_pct,
+                "latency_ms_all": {
+                    "mean": round(statistics.mean(all_lat), 3) if all_lat else None,
+                    "p50": round(statistics.median(all_lat), 3) if all_lat else None,
+                    "p95": round(
+                        statistics.quantiles(all_lat, n=20)[18]
+                        if len(all_lat) >= 2 else all_lat[0], 3) if all_lat else None,
+                },
+                "total_hits": total_hits_n,
+                "scenarios_used": sorted(_strategy_conns.keys()),
+            }
+            scenario_results[scenario] = r
+            print(json.dumps({
+                "event": "scenario", "name": scenario,
+                "avg_response_tokens": r["avg_response_tokens"],
+                "avg_savings_pct": r["avg_vs_baseline_savings_pct"],
+                "latency_ms_all": r["latency_ms_all"],
+                "scenarios_used": r["scenarios_used"],
+            }, ensure_ascii=False))
             continue
         mode = "bm25" if scenario == "mdq_bm25" else "grep"
         r = run_search_scenario(
@@ -668,7 +695,6 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k, max_tokens=args.max_tokens,
             repeat=args.repeat, path_globs=args.paths,
             baseline_tokens_total=baseline_tokens_total,
-            baseline_context_text=baseline_context_text,
         )
         scenario_results[scenario] = r
         print(json.dumps({
@@ -676,9 +702,6 @@ def main(argv: list[str] | None = None) -> int:
             "name": scenario,
             "avg_response_tokens": r["avg_response_tokens"],
             "avg_savings_pct": r["avg_vs_baseline_savings_pct"],
-            "avg_without_skill_prompt_tokens": r.get("avg_without_skill_prompt_tokens"),
-            "avg_with_skill_prompt_tokens": r.get("avg_with_skill_prompt_tokens"),
-            "avg_reduction_pct": r.get("avg_reduction_pct"),
             "latency_ms_all": r["latency_ms_all"],
         }, ensure_ascii=False))
 
