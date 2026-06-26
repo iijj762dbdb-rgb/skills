@@ -1,3 +1,8 @@
+---
+name: safe-ops-check
+description: Use before operations that may affect real files, backups, archives, systemd workers, deletes, moves, restores, or irreversible data.
+---
+
 # safe-ops-check
 
 ## Purpose

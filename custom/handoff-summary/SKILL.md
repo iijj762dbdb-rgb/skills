@@ -1,3 +1,8 @@
+---
+name: handoff-summary
+description: Use when summarizing completed work, verification results, changed files, risks, and next steps for another chat, agent, or human reviewer.
+---
+
 # handoff-summary
 
 ## Purpose

@@ -1,3 +1,8 @@
+---
+name: docs-audit
+description: Use when auditing project docs for stale content, contradictions, duplication, or unclear source-of-truth boundaries before editing or indexing.
+---
+
 # docs-audit
 
 ## Purpose
