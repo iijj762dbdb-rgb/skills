@@ -18,6 +18,7 @@ Document Inbox MVP の実ファイル・バックアップ・pCloud・sora archi
 - rsync / rclone を使う作業
 - systemd timer / worker がファイルを処理する作業
 - 原本やバックアップに影響する可能性がある作業
+- fork / remote / force push を含む Git 操作
 
 ## Golden rules
 
@@ -33,6 +34,7 @@ Document Inbox MVP の実ファイル・バックアップ・pCloud・sora archi
 - restore は本番 data_root へ直接上書きしない
 - DB更新とファイル操作の順序に注意する
 - 失敗時は削除ではなく停止・除外・再試行・手動復旧を優先する
+- `git push --force` はユーザーが明示しない限り禁止
 
 ## Pre-flight checklist
 
@@ -49,6 +51,20 @@ Document Inbox MVP の実ファイル・バックアップ・pCloud・sora archi
 9. 失敗しても再実行可能か
 10. rollback または手動復旧の道があるか
 
+## Git / Fork safety
+
+fork、remote、push、force push を扱う前に確認すること:
+
+1. `git remote -v` で remote を確認する。
+2. `origin` が自分の repo か、本家 repo かを確認する。
+3. `upstream` がある場合は本家 repo として扱う。
+4. push 前に `git fetch origin` を実行する。
+5. `git log --oneline --left-right --graph --cherry-pick HEAD...origin/main` などでローカル / リモート差分を見る。
+6. remote にだけあるコミットがある場合は force push しない。
+7. 必要ならまず `git pull --rebase origin main` を検討する。
+8. 実 push 前に `git push --dry-run` を実行する。
+9. `git push --force` はユーザーが明示しない限り実行しない。
+
 ## Dangerous words
 
 以下が出てきたら必ず立ち止まる:
@@ -63,6 +79,7 @@ Document Inbox MVP の実ファイル・バックアップ・pCloud・sora archi
 - `overwrite`
 - `DROP TABLE`
 - `DELETE FROM`
+- `git push --force`
 - production `data_root`
 - `/mnt/archive`
 - `/mnt/inbox`
@@ -79,20 +96,27 @@ find <path> -maxdepth 2 -type f | head
 df -h
 ls -la
 git diff --check
+git remote -v
+git fetch origin
+git log --oneline --left-right --graph --cherry-pick HEAD...origin/main
+git push --dry-run
+```
 
 優先する操作:
 
-copy
-copy2
-rclone copy
-dry-run
-read-only inventory
-candidate review
-checksum verification
-Output format
-Safety verdict: OK / caution / stop
-Why
-Checked risks
-Commands to run
-Commands to avoid
-Remaining risks
+- copy
+- copy2
+- rclone copy
+- dry-run
+- read-only inventory
+- candidate review
+- checksum verification
+
+## Output format
+
+- Safety verdict: OK / caution / stop
+- Why
+- Checked risks
+- Commands to run
+- Commands to avoid
+- Remaining risks
